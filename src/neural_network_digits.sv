@@ -44,7 +44,7 @@ module neural_network_digits (
 
   // Imagen 
   logic [3:0] image_flat [0:63];
-  logic [3:0] row, col;
+  logic [3:0] fila, columna;
 
   // Neuronas
   logic [7:0] neuronas_capa1 [0:15]; // tras ReLU + ≫ 5 + clamp 255
@@ -106,9 +106,9 @@ module neural_network_digits (
 
   // Obtener los 64 pixeles en un arreglo de 1 dimension donde cada pixel es de 4 bits
   always_comb begin
-    for (row = 0; row < 8; row++) begin : gen_flat_row
-      for (col = 0; col < 8; col++) begin : gen_flat_col
-        image_flat[row * 8 + col] = image[row][col];
+    for (fila = 0; fila < 8; fila++) begin : gen_flat_fila
+      for (columna = 0; columna < 8; columna++) begin : gen_flat_columna
+        image_flat[fila * 8 + columna] = image[fila][columna];
       end
     end
   end
