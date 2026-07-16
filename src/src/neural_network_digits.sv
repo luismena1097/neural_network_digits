@@ -1,0 +1,263 @@
+/*
+    Proyecto Final: Red Neuronal para reconocimiento de dígitos
+    Descripción:
+        - Utiliza de entrada imagenes de 8x8 píxeles donde cada pixel se conforma por 4 bits
+        - Entrega una variable de 4 bits que representa el digito mayor probable 
+    Fecha: Julio/2026
+*/
+
+module neural_network_digits (
+ input logic clk ,
+ input logic rst ,
+ input logic start ,
+ input logic [3:0] image [7:0][7:0], 
+ output logic done ,
+ output logic [3:0] digit
+);
+  logic start_r;
+  logic [3:0] image_r [7:0][7:0];
+  logic done_internal;
+  logic [3:0] digit_internal;
+  
+  localparam int N_FMA = 16;
+  
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      start_r <= 1'b0;
+      for (int i = 0; i < 8; i++) begin
+        for (int j = 0; j < 8; j++) begin
+          image_r[i][j] <= 4'b0;
+        end
+      end
+    end else begin
+      start_r <= start;
+      image_r <= image;
+    end
+  end
+  
+  logic weights_layer1_rd_en;
+  logic weights_layer2_rd_en;
+  logic bias_rd_en;
+
+  // Señales ROMs  
+  logic [10:0] weight_addr;         // Direccion de la ROM de pesos 
+  logic [4:0]  bias_addr;           // Direccion de la ROM de bias
+  logic signed [31:0] bias_data;    // Salida de la ROM de bias que esta en 32 bits
+  logic [7:0] w_data [0:N_FMA-1];   // Salen 16 weights de 8 bits de la ROM
+  logic [N_FMA*8-1:0] w_data_packed;// Salen 16 weights de 8 bits de la ROM
+  
+  // Habilitación unificada de pesos (activa en capa 1 o capa 2)
+  logic weights_rd_en;
+  assign weights_rd_en = weights_layer1_rd_en | weights_layer2_rd_en;
+
+  logic [1:0] bloque_fma_cuenta;
+  logic [3:0] contador_neuronas_l1;
+  logic [3:0] contador_neuronas_l2;
+  logic       stage;
+
+  // Señales para transición de estados en la FSM
+  logic last_p1, last_n1, last_n2;
+
+  // Imagen 
+  logic [3:0] image_flat [0:63];
+  logic [3:0] fila, columna;
+
+  // Neuronas
+  logic [7:0] neuronas_capa1 [0:15]; // tras ReLU + ≫ 5 + clamp 255
+  logic signed [31:0] neuronas_capa2 [0:9];
+
+  logic [7:0] fma_srca_mux [0:N_FMA-1];
+  logic signed [31:0] bloque_fma [0:N_FMA];
+  logic signed [31:0] acumulador;
+  logic signed [31:0] fma_pipeline_reg;
+  logic acc_init;
+  logic signed [31:0] fma_result;
+
+  // Recuantificacion 
+  logic        recuantificacion;
+  logic [31:0] ReLu;
+  logic [31:0] ReLu_shifted_5pos;
+  logic [7:0]  valor_neurona_l1;
+
+  //Resultado 
+  logic [3:0] argmax_neuronas_l2;
+
+  assign last_p1 = (bloque_fma_cuenta == 2'd3)  && (stage == 1'b1);
+  assign last_n1 = (contador_neuronas_l1 == 4'd15) && (stage == 1'b1);
+  assign last_n2 = (contador_neuronas_l2 == 4'd9)  && (stage == 1'b1);
+
+  fsm u_fsm (
+    .clk                  (clk),
+    .rst                  (rst),
+    .start                (start_r),
+    .last_p1              (last_p1),
+    .last_n1              (last_n1),
+    .last_n2              (last_n2),
+    .done                 (done_internal),
+    .weights_layer1_rd_en (weights_layer1_rd_en),
+    .weights_layer2_rd_en (weights_layer2_rd_en),
+    .bias_rd_en           (bias_rd_en)
+  );
+
+  // ROM de pesos
+  rom_weights #(.N_WORDS(N_FMA)) u_rom_weights (
+    .addr (weights_rd_en ? weight_addr : 11'd0),
+    .q    (w_data_packed)
+  );
+
+  // ROM de bias 
+  rom_bias u_rom_bias (
+    .addr (bias_rd_en ? bias_addr : 5'd0),
+    .q    (bias_data)
+  );
+
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      bloque_fma_cuenta <= 2'd0;
+      stage <= 1'b0;
+    end else if (weights_layer1_rd_en | weights_layer2_rd_en) begin
+      stage <= ~stage;
+      if (stage == 1'b1 && weights_layer1_rd_en)
+        bloque_fma_cuenta <= bloque_fma_cuenta + 2'd1;
+    end else begin
+      bloque_fma_cuenta <= 2'd0;
+      stage <= 1'b0;
+    end
+  end
+
+  // Obtener los 64 pixeles en un arreglo de 1 dimension donde cada pixel es de 4 bits
+  always_comb begin
+    for (fila = 0; fila < 8; fila++) begin : gen_flat_fila
+      for (columna = 0; columna < 8; columna++) begin : gen_flat_columna
+        image_flat[fila * 8 + columna] = image_r[fila][columna];
+      end
+    end
+  end
+
+  // Muxes de srca para cada FMA
+  // Si no estamos en el estado de "Layer 2" se toma el pixel de la imagen, si estamos en "Layer 2" se toma la activación de la capa 1
+  genvar k;
+  generate
+    for (k = 0; k < N_FMA; k++) begin : gen_mux_a
+      assign fma_srca_mux[k] = weights_layer2_rd_en ? neuronas_capa1[k] : {4'b0, image_flat[{bloque_fma_cuenta, 4'(k)}]};   
+    end
+  endgenerate
+
+  // Selector para entrada C del FMA para definir si será el BIAS o el acumulador
+  assign acc_init = weights_layer1_rd_en ? (bloque_fma_cuenta == 2'd0) : weights_layer2_rd_en ? 1'b1  : 1'b0;
+
+  // c_in del FMA[0]: bias en pasada 0, acumulador en pasadas 1..3
+  assign bloque_fma[0] = acc_init ? bias_data : acumulador;
+
+  generate
+    for (k = 0; k < N_FMA; k++) begin : gen_bloque_fma
+      assign w_data[k] = w_data_packed[k*8 +: 8];
+      if (k == 8) begin : gen_fma_pipe
+        fma_unit u_fma (
+          .a    (fma_srca_mux[k]),
+          .b    ($signed(w_data[k])),
+          .c_in (fma_pipeline_reg),
+          .out  (bloque_fma[k+1])
+        );
+      end else begin : gen_fma_chain
+        fma_unit u_fma (
+          .a    (fma_srca_mux[k]),
+          .b    ($signed(w_data[k])),
+          .c_in (bloque_fma[k]),
+          .out  (bloque_fma[k+1])
+        );
+      end
+    end
+  endgenerate
+
+  assign fma_result = bloque_fma[N_FMA];
+
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      acumulador <= 32'd0;
+      fma_pipeline_reg <= 32'd0;
+    end else if (weights_layer1_rd_en | weights_layer2_rd_en) begin
+      fma_pipeline_reg <= bloque_fma[8];
+      if (stage == 1'b1)
+        acumulador <= fma_result;
+    end
+  end
+
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst)
+      contador_neuronas_l1 <= 4'd0;
+    else if (weights_layer1_rd_en && bloque_fma_cuenta == 2'd3 && stage == 1'b1)
+      contador_neuronas_l1 <= (contador_neuronas_l1 == 4'd15) ? 4'd0 : contador_neuronas_l1 + 4'd1;
+    else if (!weights_layer1_rd_en)
+      contador_neuronas_l1 <= 4'd0;
+  end
+
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst)
+      contador_neuronas_l2 <= 4'd0;
+    else if (weights_layer2_rd_en && stage == 1'b1)
+      contador_neuronas_l2 <= (contador_neuronas_l2 == 4'd9) ? 4'd0 : contador_neuronas_l2 + 4'd1;
+    else if (!weights_layer2_rd_en)
+      contador_neuronas_l2 <= 4'd0;
+  end
+
+  // Direcciones de ROM (combinacional desde contadores)
+  // Layer 1: weight_addr = contador_neuronas_l1×64  + bloque_fma_cuenta×16
+  // Layer 2: weight_addr = 1024      + contador_neuronas_l2×16
+
+  always_comb begin
+    if (weights_layer1_rd_en) begin
+      weight_addr = {1'b0,   contador_neuronas_l1,  6'b000000}       // contador_neuronas_l1  × 64
+                  + {5'b0,   bloque_fma_cuenta,  4'b0000};         // bloque_fma_cuenta  × 16
+      bias_addr   = {1'b0,   contador_neuronas_l1};                   // 0..15
+    end else if (weights_layer2_rd_en) begin
+      weight_addr = 11'd1024
+                  + {3'b0,   contador_neuronas_l2, 4'b0000};         // contador_neuronas_l2 × 16
+      bias_addr   = 5'd16 + {1'b0, contador_neuronas_l2};            // 16..25
+    end else begin
+      weight_addr = 11'd0;
+      bias_addr   = 5'd0;
+    end
+  end
+
+  assign recuantificacion = weights_layer1_rd_en && (bloque_fma_cuenta == 2'd3) && (stage == 1'b1);
+
+  // En hardware, sobre un valor en complemento a dos, ReLU se implementa con un mux gobernado
+  // por el bit de signo: si el signo es 1 la salida es 0, si es 0 pasa el valor completo.
+  assign ReLu  = fma_result[31] ? 32'd0 : fma_result;
+
+  assign ReLu_shifted_5pos = {5'b0, ReLu[31:5]};  // Desplazamiento a la derecha de 5 posiciones
+
+  assign valor_neurona_l1 = (ReLu_shifted_5pos > 32'd255) ? 8'd255 : ReLu_shifted_5pos[7:0]; // Saturacion a 255
+
+  always_ff @(posedge clk) begin
+    if (recuantificacion)
+      neuronas_capa1[contador_neuronas_l1] <= valor_neurona_l1;
+  end
+
+  always_ff @(posedge clk) begin
+    if (weights_layer2_rd_en && stage == 1'b1)
+      neuronas_capa2[contador_neuronas_l2] <= fma_result;
+  end
+
+  always_comb begin
+    argmax_neuronas_l2 = 4'd0;                       
+    for (int i = 1; i < 10; i++) begin
+      if (neuronas_capa2[i] > neuronas_capa2[argmax_neuronas_l2])
+        argmax_neuronas_l2 = 4'(i);
+    end
+  end
+
+  assign digit_internal = argmax_neuronas_l2;
+
+  always_ff @(posedge clk or posedge rst) begin
+    if (rst) begin
+      done <= 1'b0;
+      digit <= 4'b0;
+    end else begin
+      done <= done_internal;
+      digit <= digit_internal;
+    end
+  end
+
+endmodule
